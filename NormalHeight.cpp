@@ -270,6 +270,7 @@ static const char* const N2H_HELP =
 class NormalToHeight : public Iop
 {
     float _scale;        // output height scale
+    float _clip;         // percentile trimmed from each end when normalizing
     bool  _directX;      // green channel convention
     bool  _normalize;    // normalize result to 0..1
 
@@ -281,6 +282,7 @@ class NormalToHeight : public Iop
 public:
     NormalToHeight(Node* node) : Iop(node)
         , _scale(1.0f)
+        , _clip(0.001f)
         , _directX(false)
         , _normalize(true)
         , _cw(0), _ch(0), _cx0(0), _cy0(0)
@@ -299,6 +301,12 @@ public:
         Bool_knob(f, &_normalize, "normalize", "normalize 0-1");
         Tooltip(f, "Remap the reconstructed height into 0..1 (recommended). "
                    "OFF: output raw integrated height (can be negative).");
+
+        Float_knob(f, &_clip, IRange(0.0, 0.1), "clip", "outlier clip");
+        Tooltip(f, "Fraction trimmed from each end before normalizing, so a few "
+                   "overshoot pixels at sharp edges don't crush the contrast. "
+                   "0 = use the absolute min/max; 0.001 = ignore the lowest/"
+                   "highest 0.1%. Only used when 'normalize' is on.");
 
         Bool_knob(f, &_directX, "directx", "directX");
         Tooltip(f, "OFF: OpenGL convention (G = +Y up) — default.\n"
@@ -444,11 +452,34 @@ public:
                     (float)(Z[(size_t)yy * FW + xx].re * invN) * _scale;
 
         if (_normalize) {
-            float mn = _height[0], mx = _height[0];
-            for (float v : _height) { mn = std::min(mn, v); mx = std::max(mx, v); }
+            // Robust (percentile) normalisation. The Frankot-Chellappa solve can
+            // produce a few overshoot/ringing pixels at sharp edges; using the
+            // absolute min/max would let those outliers dominate the range and
+            // crush the mid-tones. Map the low/high percentile points to 0/1
+            // instead so the bulk of the image uses the full 0..1 contrast.
+            const size_t n = _height.size();
+            std::vector<float> sorted(_height);
+            std::sort(sorted.begin(), sorted.end());
+
+            // _clip is the fraction trimmed from EACH end (e.g. 0.001 = 0.1%).
+            float clip = _clip;
+            if (clip < 0.0f) clip = 0.0f;
+            if (clip > 0.49f) clip = 0.49f;
+
+            size_t loIdx = (size_t)(clip * (double)(n - 1));
+            size_t hiIdx = (size_t)((1.0 - clip) * (double)(n - 1));
+            if (hiIdx <= loIdx) { loIdx = 0; hiIdx = n - 1; }
+
+            const float mn = sorted[loIdx];
+            const float mx = sorted[hiIdx];
             const float range = (mx - mn);
             const float inv = range > 1e-8f ? 1.0f / range : 0.0f;
-            for (float& v : _height) v = (v - mn) * inv;
+            for (float& v : _height) {
+                float nv = (v - mn) * inv;     // map [lo,hi] percentile -> [0,1]
+                if (nv < 0.0f) nv = 0.0f;       // clamp the trimmed outliers
+                if (nv > 1.0f) nv = 1.0f;
+                v = nv;
+            }
         }
 
         _cacheValid = true;
