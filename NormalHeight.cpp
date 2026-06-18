@@ -159,8 +159,10 @@ public:
 
     void _request(int x, int y, int r, int t, ChannelMask channels, int count) override
     {
-        // Need neighbours for central differences -> request a 1px-padded box.
-        input0().request(x - 1, y - 1, r + 1, t + 1, Mask_RGB, count);
+        // Wrap-around central differences can read any pixel -> request the
+        // whole input box (matches the full-region Tile built in engine()).
+        const Box& b = input0().info().box();
+        input0().request(b.x(), b.y(), b.r(), b.t(), Mask_RGB, count);
     }
 
     void engine(int y, int x, int r, ChannelMask channels, Row& out) override
@@ -171,8 +173,10 @@ public:
         const int W = x1 - x0, H = y1 - y0;
         if (W <= 0 || H <= 0) { out.erase(channels); return; }
 
-        // Load a 3-row tile (y-1 .. y+1) covering the requested x range plus 1px.
-        Tile tile(input0(), x - 1, y - 1, r + 1, y + 2, Mask_RGB);
+        // Cover the FULL input region so wrap-around neighbour lookups stay in
+        // bounds (a tile covering only the current row would crash when the
+        // central-difference sample wraps to the opposite edge).
+        Tile tile(input0(), x0, y0, x1, y1, Mask_RGB);
         if (aborted()) return;
 
         auto wrapX = [&](int xx) { int v = ((xx - x0) % W + W) % W + x0; return v; };
@@ -291,7 +295,8 @@ public:
         copy_info();
         info_.turn_on(Mask_RGB);
         set_out_channels(Mask_RGB);
-        // Invalidate cache; recompute lazily in engine on first access.
+        // Force a recompute; the heavy full-image solve happens once in
+        // _open() (single-threaded), never in engine() (worker threads).
         _cacheValid = false;
     }
 
@@ -300,6 +305,13 @@ public:
         // FC integration needs the whole image.
         const Box& b = input0().info().box();
         input0().request(b.x(), b.y(), b.r(), b.t(), Mask_RGB, count);
+    }
+
+    // Called once on the main thread before engine() runs on workers. This is
+    // the safe place to do the whole-image FFT solve and fill the cache.
+    void _open() override
+    {
+        if (!_cacheValid) buildCache();
     }
 
     // Decode + integrate the full image once; store into _height.
@@ -417,11 +429,9 @@ public:
 
     void engine(int y, int x, int r, ChannelMask channels, Row& out) override
     {
-        if (!_cacheValid) {
-            buildCache();
-            if (aborted()) return;
-        }
-        if (_height.empty()) { out.erase(channels); return; }
+        // Cache is built in _open() (main thread). Never solve here: engine()
+        // runs on multiple worker threads and a write race would crash.
+        if (!_cacheValid || _height.empty()) { out.erase(channels); return; }
 
         const int W = _cw, H = _ch;
         auto wrapX = [&](int xx) { return ((xx - _cx0) % W + W) % W; };
