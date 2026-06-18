@@ -123,12 +123,14 @@ class HeightToNormal : public Iop
     float _strength;     // gradient strength multiplier
     bool  _directX;      // green channel convention
     int   _heightSrc;    // 0=red, 1=luminance
+    bool  _emptyInput;   // true when input0 is unconnected
 
 public:
     HeightToNormal(Node* node) : Iop(node)
         , _strength(1.0f)
         , _directX(false)
         , _heightSrc(0)
+        , _emptyInput(true)
     {}
 
     const char* Class() const override { return H2N_CLASS; }
@@ -151,6 +153,15 @@ public:
 
     void _validate(bool for_real) override
     {
+        // Guard against an unconnected input: copy_info() would dereference a
+        // null source Op and crash. Leave the base Iop's default (black) info
+        // untouched and bail — matches the proven HexTile pattern.
+        if (input0().node() == nullptr) {
+            _emptyInput = true;
+            set_out_channels(Mask_None);
+            return;
+        }
+        _emptyInput = false;
         copy_info();
         // We always output RGB; ensure those channels exist downstream.
         info_.turn_on(Mask_RGB);
@@ -159,6 +170,7 @@ public:
 
     void _request(int x, int y, int r, int t, ChannelMask channels, int count) override
     {
+        if (input0().node() == nullptr) return;
         // Wrap-around central differences can read any pixel -> request the
         // whole input box (matches the full-region Tile built in engine()).
         const Box& b = input0().info().box();
@@ -171,7 +183,10 @@ public:
         const int x0 = ibox.x(), y0 = ibox.y();
         const int x1 = ibox.r(), y1 = ibox.t();
         const int W = x1 - x0, H = y1 - y0;
-        if (W <= 0 || H <= 0) { out.erase(channels); return; }
+        // Bail on degenerate input. An unconnected input resolves to a 1x1 black
+        // Iop (node() is non-null), which has no meaningful gradient and whose
+        // tiny Tile would be read out of bounds by the neighbour lookups.
+        if (W < 2 || H < 2) { out.erase(channels); return; }
 
         // Cover the FULL input region so wrap-around neighbour lookups stay in
         // bounds (a tile covering only the current row would crash when the
@@ -292,6 +307,14 @@ public:
 
     void _validate(bool for_real) override
     {
+        // Guard against an unconnected input (copy_info() would crash on a
+        // null source Op). Leave the base Iop's default (black) info untouched.
+        if (input0().node() == nullptr) {
+            set_out_channels(Mask_None);
+            _cacheValid = true;   // nothing to solve
+            _height.clear();
+            return;
+        }
         copy_info();
         info_.turn_on(Mask_RGB);
         set_out_channels(Mask_RGB);
@@ -302,6 +325,7 @@ public:
 
     void _request(int x, int y, int r, int t, ChannelMask channels, int count) override
     {
+        if (input0().node() == nullptr) return;
         // FC integration needs the whole image.
         const Box& b = input0().info().box();
         input0().request(b.x(), b.y(), b.r(), b.t(), Mask_RGB, count);
@@ -311,6 +335,7 @@ public:
     // the safe place to do the whole-image FFT solve and fill the cache.
     void _open() override
     {
+        if (input0().node() == nullptr) { _cacheValid = true; _height.clear(); return; }
         if (!_cacheValid) buildCache();
     }
 
@@ -321,7 +346,9 @@ public:
         _cx0 = ibox.x(); _cy0 = ibox.y();
         _cw = ibox.r() - ibox.x();
         _ch = ibox.t() - ibox.y();
-        if (_cw <= 0 || _ch <= 0) { _cacheValid = true; _height.clear(); return; }
+        // Bail on degenerate input (e.g. the 1x1 black Iop from an unconnected
+        // input). engine() then erases to black.
+        if (_cw < 2 || _ch < 2) { _cacheValid = true; _height.clear(); return; }
 
         Tile tile(input0(), ibox.x(), ibox.y(), ibox.r(), ibox.t(), Mask_RGB);
         if (aborted()) return;
