@@ -262,8 +262,7 @@ const Iop::Description HeightToNormal::d(H2N_CLASS, "Filter/HeightToNormal", bui
 // NormalToHeight — tangent-space normal map -> height map
 // (Frankot-Chellappa: least-squares gradient integration via FFT)
 // ===========================================================================
-static const char* const N2H_CLASS  = "NormalToHeight";
-static const char* const N2H2_CLASS = "NormalToHeight2";
+static const char* const N2H_CLASS = "NormalToHeight";
 static const char* const N2H_HELP =
     "NormalToHeight (vmt_NormalToHeight) — reconstruct a height map from a "
     "tangent-space normal map.\n"
@@ -278,14 +277,8 @@ static const char* const N2H_HELP =
 
 class NormalToHeight : public Iop
 {
-    // _variant selects how 'strength' is applied:
-    //   0 (NormalToHeight)  — strength scales the slope BEFORE normalisation, so
-    //                          a uniform positive scale is absorbed by the 0..1
-    //                          remap (only sign/zero/relative balance matter).
-    //   1 (NormalToHeight2) — strength is applied AFTER normalisation about 0.5,
-    //                          so positive values change the output amplitude too.
-    int   _variant;
     float _strength;     // scales the input normal's tangent (slope) -1..1
+    float _maxSlope;     // clip |p|,|q| to this to kill grazing-normal spikes
     float _clip;         // percentile trimmed from each end when normalizing (fixed)
     bool  _directX;      // green channel convention
 
@@ -295,19 +288,18 @@ class NormalToHeight : public Iop
     bool _cacheValid;
 
 public:
-    NormalToHeight(Node* node, int variant) : Iop(node)
-        , _variant(variant)
+    NormalToHeight(Node* node) : Iop(node)
         , _strength(1.0f)
+        , _maxSlope(5.0f)
         , _clip(0.00001f)
         , _directX(false)
         , _cw(0), _ch(0), _cx0(0), _cy0(0)
         , _cacheValid(false)
     {}
 
-    const char* Class() const override { return _variant ? N2H2_CLASS : N2H_CLASS; }
+    const char* Class() const override { return N2H_CLASS; }
     const char* node_help() const override { return N2H_HELP; }
-    static const Iop::Description d;    // NormalToHeight  (variant 0)
-    static const Iop::Description d2;   // NormalToHeight2 (variant 1)
+    static const Iop::Description d;
 
     void knobs(Knob_Callback f) override
     {
@@ -316,6 +308,13 @@ public:
                    "space before integration, i.e. how strongly the surface tilts. "
                    "1.0 = use the normal as-is (default). Lower values flatten the "
                    "relief; negative values invert it. Range -1..1.");
+
+        Float_knob(f, &_maxSlope, IRange(1.0, 50.0), "max_slope", "max slope");
+        Tooltip(f, "Clips the per-pixel slope |dz/dx|,|dz/dy| before integration. "
+                   "Stray near-grazing normals (nz~0, e.g. a lone RGB=255/0 dot) "
+                   "make the slope explode and the FFT turns it into a sharp "
+                   "white/black peak. Lower this if you see such spikes (3-10 is a "
+                   "good range); raise it to allow steeper walls. Default 5.");
 
         Bool_knob(f, &_directX, "directx", "directX");
         Tooltip(f, "OFF: OpenGL convention (G = +Y up) — default.\n"
@@ -389,19 +388,31 @@ public:
                 float ng = sample(Chan_Green, sx, sy, 0.5f);
                 float nb = sample(Chan_Blue,  sx, sy, 1.0f);
 
-                // Decode 0..1 -> [-1,1]. In variant 0 the tangent (X/Y) components
-                // are scaled by 'strength' here in normal space (sign inverts,
-                // 0 flattens; a uniform positive scale is later absorbed by the
-                // 0..1 normalisation). Variant 1 applies strength after normalising.
-                const double sTan = _variant ? 1.0 : (double)_strength;
-                double nx = ((double)nr * 2.0 - 1.0) * sTan;
-                double ny = ((double)ng * 2.0 - 1.0) * gy_sign * sTan;
+                // Decode 0..1 -> [-1,1]. The tangent (X/Y) components are scaled
+                // by 'strength' in normal space (sign inverts, 0 flattens; a
+                // uniform positive scale is absorbed by the 0..1 normalisation).
+                double nx = ((double)nr * 2.0 - 1.0) * (double)_strength;
+                double ny = ((double)ng * 2.0 - 1.0) * gy_sign * (double)_strength;
                 double nz = (double)nb * 2.0 - 1.0;
                 if (nz < 1e-4) nz = 1e-4; // avoid divide-by-zero at grazing normals
 
                 // Slope: surface z(x,y), normal ~ (-dz/dx, -dz/dy, 1).
-                p[(size_t)yy * W + xx] = -nx / nz;
-                q[(size_t)yy * W + xx] = -ny / nz;
+                double pv = -nx / nz;
+                double qv = -ny / nz;
+
+                // Clip the slope. A near-grazing normal (nz ~ 0, e.g. a stray
+                // RGB=255/0 dot in the source) makes the slope blow up toward
+                // infinity, which the FFT integrator turns into a sharp white/black
+                // impulse (the "peak artifact"). Limiting |p|,|q| to max_slope
+                // suppresses those spikes; max_slope is also the tallest wall the
+                // height field can represent (a height map cannot encode an
+                // overhang / true vertical face).
+                const double ms = (double)_maxSlope;
+                if (pv >  ms) pv =  ms; else if (pv < -ms) pv = -ms;
+                if (qv >  ms) qv =  ms; else if (qv < -ms) qv = -ms;
+
+                p[(size_t)yy * W + xx] = pv;
+                q[(size_t)yy * W + xx] = qv;
             }
         }
 
@@ -502,18 +513,6 @@ public:
             }
         }
 
-        // Variant 1: apply 'strength' as an amplitude scale AFTER normalisation,
-        // about the 0.5 mid-grey. +1 = unchanged, 0 = flat 0.5, -1 = inverted.
-        // (Variant 0 already applied strength to the slope before normalising.)
-        if (_variant) {
-            for (float& v : _height) {
-                float nv = 0.5f + (v - 0.5f) * _strength;
-                if (nv < 0.0f) nv = 0.0f;
-                if (nv > 1.0f) nv = 1.0f;
-                v = nv;
-            }
-        }
-
         _cacheValid = true;
     }
 
@@ -540,7 +539,5 @@ public:
     }
 };
 
-static Iop* buildN2H(Node* node)  { return new NormalToHeight(node, 0); }
-static Iop* buildN2H2(Node* node) { return new NormalToHeight(node, 1); }
-const Iop::Description NormalToHeight::d (N2H_CLASS,  "Filter/NormalToHeight",  buildN2H);
-const Iop::Description NormalToHeight::d2(N2H2_CLASS, "Filter/NormalToHeight2", buildN2H2);
+static Iop* buildN2H(Node* node) { return new NormalToHeight(node); }
+const Iop::Description NormalToHeight::d(N2H_CLASS, "Filter/NormalToHeight", buildN2H);
