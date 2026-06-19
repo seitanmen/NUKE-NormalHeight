@@ -225,19 +225,19 @@ public:
         const float k = _strength * 200.0f;
 
         for (int px = x; px < r; ++px) {
-            // FORWARD differences on the height field. Unlike central differences
-            // ((x+1)-(x-1)), forward differences ((x+1)-x) couple adjacent pixels
-            // directly, so the even/odd sub-grids stay linked. Central differences
-            // skip the centre pixel, decoupling the grid into two independent
-            // checkerboards that the FFT integrator cannot tie together — that is
-            // what produced the 1-pixel "grid grain" visible when zoomed in.
-            const float hc = heightAt(px,     y);
+            // Central differences (Sobel-lite, 2-tap) on the height field. This
+            // gives the smoother, higher-quality normals; NormalToHeight uses a
+            // forward-difference Poisson kernel independently, so the two nodes
+            // are not a bit-exact round-trip pair (acceptable here — H2N quality
+            // is prioritised).
+            const float hl = heightAt(px - 1, y);
             const float hr = heightAt(px + 1, y);
-            const float hu = heightAt(px,     y + 1);
+            const float hd = heightAt(px, y - 1);
+            const float hu = heightAt(px, y + 1);
 
             // Gradient of height; normal = normalize(-dHdx, -dHdy, 1).
-            const float dHdx = (hr - hc) * k;
-            const float dHdy = (hu - hc) * k;
+            const float dHdx = (hr - hl) * 0.5f * k;
+            const float dHdy = (hu - hd) * 0.5f * k;
 
             float nx = -dHdx;
             float ny = -dHdy * gy_sign;
