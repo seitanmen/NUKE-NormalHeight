@@ -225,15 +225,19 @@ public:
         const float k = _strength * 200.0f;
 
         for (int px = x; px < r; ++px) {
-            // Central differences (Sobel-lite, 2-tap) on the height field.
-            const float hl = heightAt(px - 1, y);
+            // FORWARD differences on the height field. Unlike central differences
+            // ((x+1)-(x-1)), forward differences ((x+1)-x) couple adjacent pixels
+            // directly, so the even/odd sub-grids stay linked. Central differences
+            // skip the centre pixel, decoupling the grid into two independent
+            // checkerboards that the FFT integrator cannot tie together — that is
+            // what produced the 1-pixel "grid grain" visible when zoomed in.
+            const float hc = heightAt(px,     y);
             const float hr = heightAt(px + 1, y);
-            const float hd = heightAt(px, y - 1);
-            const float hu = heightAt(px, y + 1);
+            const float hu = heightAt(px,     y + 1);
 
             // Gradient of height; normal = normalize(-dHdx, -dHdy, 1).
-            const float dHdx = (hr - hl) * 0.5f * k;
-            const float dHdy = (hu - hd) * 0.5f * k;
+            const float dHdx = (hr - hc) * k;
+            const float dHdy = (hu - hc) * k;
 
             float nx = -dHdx;
             float ny = -dHdy * gy_sign;
@@ -405,31 +409,38 @@ public:
         fftutil::fft2d(P, FW, FH, -1);
         fftutil::fft2d(Q, FW, FH, -1);
 
-        // Z(wx,wy) = -i(wx*P + wy*Q) / (wx^2 + wy^2)
-        //
-        // We use the central-difference frequency response sin(w) rather than the
-        // continuous-derivative frequency w. This matches the discrete gradient
-        // operator (central differences) that HeightToNormal uses, so the two
-        // nodes round-trip to numerical precision instead of diverging on high
-        // frequencies. (A verified standalone test gives RMS error ~1e-16 with
-        // this kernel vs ~3e-3 with the continuous kernel.)
+        // Solve the Poisson equation in the frequency domain using the FORWARD
+        // difference operator, to exactly match HeightToNormal's forward-difference
+        // gradient. For forward differences the per-axis frequency response is
+        //     D(w) = e^{i w} - 1                      (w = 2*pi*k/N)
+        // and the least-squares height is
+        //     Z = (conj(Dx)*P + conj(Dy)*Q) / (|Dx|^2 + |Dy|^2),
+        // with |D(w)|^2 = 2(1 - cos w). This kernel has NO zero at the Nyquist
+        // frequency (unlike the central-difference sin(w) kernel), so the even/odd
+        // sub-grids stay coupled and the 1-pixel grid grain disappears.
         std::vector<fftutil::Cplx> Z((size_t)FW * FH, {0.0, 0.0});
         for (int ky = 0; ky < FH; ++ky) {
-            const double wy = std::sin(2.0 * M_PI * ((ky <= FH / 2) ? ky : ky - FH) / (double)FH);
+            const double ay = 2.0 * M_PI * ((ky <= FH / 2) ? ky : ky - FH) / (double)FH;
+            // conj(Dy) = e^{-i ay} - 1 = (cos ay - 1) - i sin ay
+            const double dyr = std::cos(ay) - 1.0;
+            const double dyi = -std::sin(ay);
             for (int kx = 0; kx < FW; ++kx) {
-                const double wx = std::sin(2.0 * M_PI * ((kx <= FW / 2) ? kx : kx - FW) / (double)FW);
-                const double denom = wx * wx + wy * wy;
+                const double ax = 2.0 * M_PI * ((kx <= FW / 2) ? kx : kx - FW) / (double)FW;
+                const double dxr = std::cos(ax) - 1.0;
+                const double dxi = -std::sin(ax);
+
+                // |Dx|^2 + |Dy|^2 = 2(1-cos ax) + 2(1-cos ay)
+                const double denom = (dxr * dxr + dxi * dxi) + (dyr * dyr + dyi * dyi);
                 const size_t idx = (size_t)ky * FW + kx;
                 if (denom < 1e-12) {
                     Z[idx].re = 0.0; Z[idx].im = 0.0; // DC = mean height (set to 0)
                     continue;
                 }
-                // num = -i (wx*P + wy*Q)
-                const double sr = wx * P[idx].re + wy * Q[idx].re;
-                const double si = wx * P[idx].im + wy * Q[idx].im;
-                // multiply by -i: (-i)(sr+ i si) = si - i sr
-                const double numr =  si;
-                const double numi = -sr;
+                // num = conj(Dx)*P + conj(Dy)*Q   (complex multiply-add)
+                const double numr = (dxr * P[idx].re - dxi * P[idx].im)
+                                  + (dyr * Q[idx].re - dyi * Q[idx].im);
+                const double numi = (dxr * P[idx].im + dxi * P[idx].re)
+                                  + (dyr * Q[idx].im + dyi * Q[idx].re);
                 Z[idx].re = numr / denom;
                 Z[idx].im = numi / denom;
             }
