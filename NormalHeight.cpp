@@ -139,8 +139,10 @@ public:
 
     void knobs(Knob_Callback f) override
     {
-        Float_knob(f, &_strength, IRange(0.0, 10.0), "strength", "strength");
-        Tooltip(f, "Multiplier on the height gradient. Higher = stronger relief.");
+        Float_knob(f, &_strength, IRange(-1.0, 1.0), "strength", "strength");
+        Tooltip(f, "Relief strength. The slider runs -1..1 and maps linearly to a "
+                   "gradient multiplier of -200..200 (slider 1.0 = x200, the "
+                   "default). Negative values invert the relief (concave <-> convex).");
 
         static const char* const srcModes[] = { "red", "luminance", nullptr };
         Enumeration_knob(f, &_heightSrc, srcModes, "height_source", "height source");
@@ -219,6 +221,8 @@ public:
         float* bOut = out.writable(Chan_Blue)  + x;
 
         const float gy_sign = _directX ? -1.0f : 1.0f;
+        // Slider -1..1 maps to a gradient multiplier of -200..200.
+        const float k = _strength * 200.0f;
 
         for (int px = x; px < r; ++px) {
             // Central differences (Sobel-lite, 2-tap) on the height field.
@@ -227,9 +231,9 @@ public:
             const float hd = heightAt(px, y - 1);
             const float hu = heightAt(px, y + 1);
 
-            // Gradient of height; normal = normalize(-dHdx, -dHdy, 1/strength).
-            const float dHdx = (hr - hl) * 0.5f * _strength;
-            const float dHdy = (hu - hd) * 0.5f * _strength;
+            // Gradient of height; normal = normalize(-dHdx, -dHdy, 1).
+            const float dHdx = (hr - hl) * 0.5f * k;
+            const float dHdy = (hu - hd) * 0.5f * k;
 
             float nx = -dHdx;
             float ny = -dHdy * gy_sign;
@@ -269,10 +273,8 @@ static const char* const N2H_HELP =
 
 class NormalToHeight : public Iop
 {
-    float _scale;        // output height scale
     float _clip;         // percentile trimmed from each end when normalizing
     bool  _directX;      // green channel convention
-    bool  _normalize;    // normalize result to 0..1
 
     // Cached reconstruction (full image, in input-box coordinates).
     std::vector<float> _height;
@@ -281,10 +283,8 @@ class NormalToHeight : public Iop
 
 public:
     NormalToHeight(Node* node) : Iop(node)
-        , _scale(1.0f)
-        , _clip(0.001f)
+        , _clip(0.00001f)
         , _directX(false)
-        , _normalize(true)
         , _cw(0), _ch(0), _cx0(0), _cy0(0)
         , _cacheValid(false)
     {}
@@ -295,18 +295,11 @@ public:
 
     void knobs(Knob_Callback f) override
     {
-        Float_knob(f, &_scale, IRange(0.0, 10.0), "scale", "scale");
-        Tooltip(f, "Multiplier on the reconstructed height before normalisation.");
-
-        Bool_knob(f, &_normalize, "normalize", "normalize 0-1");
-        Tooltip(f, "Remap the reconstructed height into 0..1 (recommended). "
-                   "OFF: output raw integrated height (can be negative).");
-
         Float_knob(f, &_clip, IRange(0.0, 0.1), "clip", "outlier clip");
-        Tooltip(f, "Fraction trimmed from each end before normalizing, so a few "
-                   "overshoot pixels at sharp edges don't crush the contrast. "
-                   "0 = use the absolute min/max; 0.001 = ignore the lowest/"
-                   "highest 0.1%. Only used when 'normalize' is on.");
+        Tooltip(f, "Fraction trimmed from each end before the 0..1 normalisation, "
+                   "so a few overshoot pixels at sharp edges don't crush the "
+                   "contrast. 0 = use the absolute min/max; 0.00001 = ignore the "
+                   "lowest/highest 0.001% (default).");
 
         Bool_knob(f, &_directX, "directx", "directX");
         Tooltip(f, "OFF: OpenGL convention (G = +Y up) — default.\n"
@@ -449,14 +442,14 @@ public:
         for (int yy = 0; yy < H; ++yy)
             for (int xx = 0; xx < W; ++xx)
                 _height[(size_t)yy * W + xx] =
-                    (float)(Z[(size_t)yy * FW + xx].re * invN) * _scale;
+                    (float)(Z[(size_t)yy * FW + xx].re * invN);
 
-        if (_normalize) {
-            // Robust (percentile) normalisation. The Frankot-Chellappa solve can
-            // produce a few overshoot/ringing pixels at sharp edges; using the
-            // absolute min/max would let those outliers dominate the range and
-            // crush the mid-tones. Map the low/high percentile points to 0/1
-            // instead so the bulk of the image uses the full 0..1 contrast.
+        {
+            // Always normalise to 0..1 with robust (percentile) min/max. The
+            // Frankot-Chellappa solve can produce a few overshoot/ringing pixels
+            // at sharp edges; using the absolute min/max would let those outliers
+            // dominate the range and crush the mid-tones. Map the low/high
+            // percentile points to 0/1 so the bulk of the image uses full contrast.
             const size_t n = _height.size();
             std::vector<float> sorted(_height);
             std::sort(sorted.begin(), sorted.end());
