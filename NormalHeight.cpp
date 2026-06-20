@@ -186,6 +186,11 @@ public:
 
     void knobs(Knob_Callback f) override
     {
+        Bool_knob(f, &_useGPUIfAvailable, "use_gpu", "use GPU if available");
+        Tooltip(f, "Run the per-pixel normal computation on the GPU via Blink "
+                   "when a GPU is available; otherwise it runs on the CPU. The "
+                   "result is identical either way.");
+
         Float_knob(f, &_strength, IRange(-1.0, 1.0), "strength", "strength");
         Tooltip(f, "Relief strength. The slider runs -1..1 and maps linearly to a "
                    "gradient multiplier of -200..200 (slider 1.0 = x200, the "
@@ -199,25 +204,25 @@ public:
         Tooltip(f, "OFF: OpenGL convention (G = +Y up) — default.\n"
                    "ON: DirectX convention (G = +Y down).");
 
-        Bool_knob(f, &_useGPUIfAvailable, "use_gpu", "use GPU if available");
-        Tooltip(f, "Run the per-pixel normal computation on the GPU via Blink "
-                   "when a GPU is available; otherwise it runs on the CPU. The "
-                   "result is identical either way.");
-
-        // All parameter descriptions collected at the bottom under "Tips".
+        // All parameter descriptions collected at the bottom under "Tips",
+        // one per line with a blank line between entries for readability.
         BeginClosedGroup(f, "Tips");
         Named_Text_knob(f, "t_about", "",
                   "HeightToNormal — builds a tangent-space normal map from a "
                   "height map.");
+        Named_Text_knob(f, "t_sp0", "", " ");
         Named_Text_knob(f, "t_strength", "",
                   "strength: relief amount, -1..1 -> gradient x(-200..200). "
                   "1 = default, 0 = flat, negative = inverted.");
+        Named_Text_knob(f, "t_sp1", "", " ");
         Named_Text_knob(f, "t_source", "",
                   "height source: 'red' = R channel only, "
                   "'luminance' = Rec.601 weighted RGB.");
+        Named_Text_knob(f, "t_sp2", "", " ");
         Named_Text_knob(f, "t_directx", "",
                   "directX: green channel convention. OFF = OpenGL (+Y up), "
                   "ON = DirectX (+Y down).");
+        Named_Text_knob(f, "t_sp3", "", " ");
         Named_Text_knob(f, "t_gpu", "",
                   "use GPU: GPU (Blink) when available, else CPU. Same result.");
         EndGroup(f);
@@ -397,19 +402,23 @@ public:
         Tooltip(f, "OFF: OpenGL convention (G = +Y up) — default.\n"
                    "ON: DirectX convention (G = +Y down).");
 
-        // All parameter descriptions collected at the bottom under "Tips".
+        // All parameter descriptions collected at the bottom under "Tips",
+        // one per line with a blank line between entries for readability.
         BeginClosedGroup(f, "Tips");
         Named_Text_knob(f, "t_about", "",
                   "NormalToHeight — reconstructs a height map from a tangent-space "
                   "normal map (Frankot-Chellappa FFT integration).");
+        Named_Text_knob(f, "t_sp0", "", " ");
         Named_Text_knob(f, "t_strength", "",
                   "strength: tilt scale on the input normal (-1..1). 1 = as-is, "
                   "0 = flat, negative = inverted. Output is renormalised, so a "
                   "uniform positive value mainly affects sign/balance.");
+        Named_Text_knob(f, "t_sp1", "", " ");
         Named_Text_knob(f, "t_maxslope", "",
                   "max slope: clips runaway slopes from near-grazing normals "
                   "(nz~0) that would become white/black spikes. Lower (3-10) to "
                   "suppress spikes, raise for steeper walls. Default 5.");
+        Named_Text_knob(f, "t_sp2", "", " ");
         Named_Text_knob(f, "t_directx", "",
                   "directX: green channel convention. OFF = OpenGL (+Y up), "
                   "ON = DirectX (+Y down). Match your input normal map.");
