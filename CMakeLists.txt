@@ -16,6 +16,11 @@ find_package(Nuke REQUIRED)
 # Build the plugin (both HeightToNormal and NormalToHeight live in one .dll)
 add_nuke_plugin(NormalHeight NormalHeight.cpp)
 
+# Blink API (GPU acceleration) lives in RIPFramework.
+if(WIN32)
+    target_link_libraries(NormalHeight PRIVATE "${NUKE_ROOT}/RIPFramework.lib")
+endif()
+
 # Deploy to production after build (環境依存パスはコミットしない)
 #   有効化: 環境変数 VMT_NUKE_DEPLOY_DIR を設定、または -DDEPLOY_DIR=... を渡す
 if(NOT DEPLOY_DIR AND DEFINED ENV{VMT_NUKE_DEPLOY_DIR})

@@ -17,10 +17,12 @@
  * Build: compile as shared library (.dll/.so/.dylib), place in Nuke plugin path.
  */
 
-#include "DDImage/Iop.h"
+#include "DDImage/PlanarIop.h"
 #include "DDImage/Row.h"
 #include "DDImage/Knobs.h"
 #include "DDImage/Tile.h"
+#include "DDImage/Blink.h"
+#include "Blink/Blink.h"
 
 #include <cmath>
 #include <vector>
@@ -118,19 +120,63 @@ static const char* const H2N_HELP =
     "OpenGL convention (+Y up) by default; enable `directx` for +Y down (green flip). "
     "Input is sampled with wrap-around, so tileable maps stay seamless.";
 
-class HeightToNormal : public Iop
+// Blink kernel: height -> tangent-space normal via central differences.
+// Ranged 2D access (±1 neighbours), edge-clamped. Params carry strength/sign/src.
+static const char* const kH2NKernel =
+"kernel HeightToNormalK : ImageComputationKernel<ePixelWise>\n"
+"{\n"
+"  Image<eRead, eAccessRanged2D, eEdgeClamped> src;\n"
+"  Image<eWrite> dst;\n"
+"  param:\n"
+"    float k;          // gradient multiplier (strength * 200)\n"
+"    float gySign;     // +1 OpenGL, -1 DirectX\n"
+"    int   heightSrc;  // 0 = red, 1 = luminance\n"
+"  void define() {\n"
+"    defineParam(k, \"K\", 200.0f);\n"
+"    defineParam(gySign, \"GySign\", 1.0f);\n"
+"    defineParam(heightSrc, \"HeightSrc\", 0);\n"
+"  }\n"
+"  void init() {\n"
+"    src.setRange(-1, -1, 1, 1);\n"
+"  }\n"
+"  float hAt(int dx, int dy) {\n"
+"    if (heightSrc == 1)\n"
+"      return 0.299f*src(dx,dy,0) + 0.587f*src(dx,dy,1) + 0.114f*src(dx,dy,2);\n"
+"    return src(dx,dy,0);\n"
+"  }\n"
+"  void process() {\n"
+"    float hl = hAt(-1,0), hr = hAt(1,0), hd = hAt(0,-1), hu = hAt(0,1);\n"
+"    float dHdx = (hr - hl) * 0.5f * k;\n"
+"    float dHdy = (hu - hd) * 0.5f * k;\n"
+"    float nx = -dHdx;\n"
+"    float ny = -dHdy * gySign;\n"
+"    float nz = 1.0f;\n"
+"    float inv = 1.0f / sqrt(nx*nx + ny*ny + nz*nz);\n"
+"    nx *= inv; ny *= inv; nz *= inv;\n"
+"    dst(0) = nx*0.5f + 0.5f;\n"
+"    dst(1) = ny*0.5f + 0.5f;\n"
+"    dst(2) = nz*0.5f + 0.5f;\n"
+"    if (dst.kComps > 3) dst(3) = 1.0f;\n"
+"  }\n"
+"};\n";
+
+class HeightToNormal : public PlanarIop
 {
     float _strength;     // gradient strength multiplier
     bool  _directX;      // green channel convention
     int   _heightSrc;    // 0=red, 1=luminance
-    bool  _emptyInput;   // true when input0 is unconnected
+    bool  _useGPUIfAvailable;
+    ::Blink::ComputeDevice _gpuDevice;
+    ::Blink::ProgramSource _program;
 
 public:
-    HeightToNormal(Node* node) : Iop(node)
+    HeightToNormal(Node* node) : PlanarIop(node)
         , _strength(1.0f)
         , _directX(false)
         , _heightSrc(0)
-        , _emptyInput(true)
+        , _useGPUIfAvailable(true)
+        , _gpuDevice(::Blink::ComputeDevice::CurrentGPUDevice())
+        , _program(kH2NKernel)
     {}
 
     const char* Class() const override { return H2N_CLASS; }
@@ -164,106 +210,120 @@ public:
         Named_Text_knob(f, "h_directx", "",
                   "directX: green channel convention. OFF = OpenGL (+Y up), "
                   "ON = DirectX (+Y down).");
+
+        Bool_knob(f, &_useGPUIfAvailable, "use_gpu", "use GPU if available");
+        Tooltip(f, "Run the per-pixel normal computation on the GPU via Blink "
+                   "when a GPU is available; otherwise it runs on the CPU. The "
+                   "result is identical either way.");
+        Named_Text_knob(f, "h_gpu", "",
+                  "use GPU: GPU (Blink) when available, else CPU. Same result.");
     }
 
     void _validate(bool for_real) override
     {
-        // Guard against an unconnected input: copy_info() would dereference a
-        // null source Op and crash. Leave the base Iop's default (black) info
-        // untouched and bail — matches the proven HexTile pattern.
-        if (input0().node() == nullptr) {
-            _emptyInput = true;
-            set_out_channels(Mask_None);
-            return;
-        }
-        _emptyInput = false;
+        if (input0().node() == nullptr) { set_out_channels(Mask_None); return; }
         copy_info();
-        // We always output RGB; ensure those channels exist downstream.
         info_.turn_on(Mask_RGB);
         set_out_channels(Mask_RGB);
     }
 
-    void _request(int x, int y, int r, int t, ChannelMask channels, int count) override
+    void getRequests(const Box& box, const ChannelSet& channels, int count,
+                     RequestOutput& reqData) const override
     {
-        if (input0().node() == nullptr) return;
-        // Wrap-around central differences can read any pixel -> request the
-        // whole input box (matches the full-region Tile built in engine()).
-        const Box& b = input0().info().box();
-        input0().request(b.x(), b.y(), b.r(), b.t(), Mask_RGB, count);
+        Box inBox = box;
+        inBox.expand(1);                         // central differences need ±1
+        inBox.intersect(input0().info());
+        reqData.request(&input0(), inBox, Mask_RGB, count);
     }
 
-    void engine(int y, int x, int r, ChannelMask channels, Row& out) override
-    {
-        const Box& ibox = input0().info().box();
-        const int x0 = ibox.x(), y0 = ibox.y();
-        const int x1 = ibox.r(), y1 = ibox.t();
-        const int W = x1 - x0, H = y1 - y0;
-        // Bail on degenerate input. An unconnected input resolves to a 1x1 black
-        // Iop (node() is non-null), which has no meaningful gradient and whose
-        // tiny Tile would be read out of bounds by the neighbour lookups.
-        if (W < 2 || H < 2) { out.erase(channels); return; }
+    bool useStripes() const override { return false; }
+    bool renderFullPlanes() const override { return true; }
 
-        // Cover the FULL input region so wrap-around neighbour lookups stay in
-        // bounds (a tile covering only the current row would crash when the
-        // central-difference sample wraps to the opposite edge).
-        Tile tile(input0(), x0, y0, x1, y1, Mask_RGB);
+    // CPU fallback (and reference). Central differences with edge clamp.
+    void renderCPU(ImagePlane& out, const ImagePlane& in, const Box& b)
+    {
+        const int x0 = b.x(), x1 = b.r(), y0 = b.y(), y1 = b.t();
+        const int nComp = out.channels().size();
+        auto clampX = [&](int x){ return x < x0 ? x0 : (x >= x1 ? x1 - 1 : x); };
+        auto clampY = [&](int y){ return y < y0 ? y0 : (y >= y1 ? y1 - 1 : y); };
+        auto hAt = [&](int x, int y) -> float {
+            const int sx = clampX(x), sy = clampY(y);
+            if (_heightSrc == 1)
+                return 0.299f*in.at(sx,sy,0) + 0.587f*in.at(sx,sy,1) + 0.114f*in.at(sx,sy,2);
+            return in.at(sx, sy, 0);
+        };
+        const float gy = _directX ? -1.0f : 1.0f;
+        const float k = _strength * 200.0f;
+        for (int y = y0; y < y1; ++y)
+            for (int x = x0; x < x1; ++x) {
+                float dHdx = (hAt(x+1,y) - hAt(x-1,y)) * 0.5f * k;
+                float dHdy = (hAt(x,y+1) - hAt(x,y-1)) * 0.5f * k;
+                float nx = -dHdx, ny = -dHdy * gy, nz = 1.0f;
+                float inv = 1.0f / std::sqrt(nx*nx + ny*ny + nz*nz);
+                nx *= inv; ny *= inv; nz *= inv;
+                out.writableAt(x, y, 0) = nx*0.5f + 0.5f;
+                if (nComp > 1) out.writableAt(x, y, 1) = ny*0.5f + 0.5f;
+                if (nComp > 2) out.writableAt(x, y, 2) = nz*0.5f + 0.5f;
+                if (nComp > 3) out.writableAt(x, y, 3) = 1.0f;
+            }
+    }
+
+    void renderStripe(ImagePlane& outputPlane) override
+    {
+        if (input0().node() == nullptr) { outputPlane.makeWritable(); return; }
+
+        Box inputBox = outputPlane.bounds();
+        inputBox.expand(1);
+        inputBox.intersect(input0().info());
+        const int W = inputBox.r() - inputBox.x();
+        const int H = inputBox.t() - inputBox.y();
+
+        ImagePlane inputPlane(inputBox, outputPlane.packed(),
+                              outputPlane.channels(), outputPlane.nComps());
+        input0().fetchPlane(inputPlane);
         if (aborted()) return;
 
-        auto wrapX = [&](int xx) { int v = ((xx - x0) % W + W) % W + x0; return v; };
-        auto wrapY = [&](int yy) { int v = ((yy - y0) % H + H) % H + y0; return v; };
+        outputPlane.makeWritable();
 
-        auto sample = [&](Channel c, int sx, int sy) -> float {
-            // tile[c] returns LinePointers; check the row pointer, not the channel.
-            const float* rowp = tile[c][sy];
-            return rowp ? rowp[sx] : 0.0f;
-        };
-        auto heightAt = [&](int xx, int yy) -> float {
-            const int sx = wrapX(xx);
-            const int sy = wrapY(yy);
-            if (_heightSrc == 1) {
-                const float rr = sample(Chan_Red,   sx, sy);
-                const float gg = sample(Chan_Green, sx, sy);
-                const float bb = sample(Chan_Blue,  sx, sy);
-                return 0.299f * rr + 0.587f * gg + 0.114f * bb;
-            }
-            return sample(Chan_Red, sx, sy);
-        };
-
-        float* rOut = out.writable(Chan_Red)   + x;
-        float* gOut = out.writable(Chan_Green) + x;
-        float* bOut = out.writable(Chan_Blue)  + x;
-
-        const float gy_sign = _directX ? -1.0f : 1.0f;
-        // Slider -1..1 maps to a gradient multiplier of -200..200.
-        const float k = _strength * 200.0f;
-
-        for (int px = x; px < r; ++px) {
-            // Central differences (Sobel-lite, 2-tap) on the height field. This
-            // gives the smoother, higher-quality normals; NormalToHeight uses a
-            // forward-difference Poisson kernel independently, so the two nodes
-            // are not a bit-exact round-trip pair (acceptable here — H2N quality
-            // is prioritised).
-            const float hl = heightAt(px - 1, y);
-            const float hr = heightAt(px + 1, y);
-            const float hd = heightAt(px, y - 1);
-            const float hu = heightAt(px, y + 1);
-
-            // Gradient of height; normal = normalize(-dHdx, -dHdy, 1).
-            const float dHdx = (hr - hl) * 0.5f * k;
-            const float dHdy = (hu - hd) * 0.5f * k;
-
-            float nx = -dHdx;
-            float ny = -dHdy * gy_sign;
-            float nz = 1.0f;
-            const float inv = 1.0f / std::sqrt(nx * nx + ny * ny + nz * nz);
-            nx *= inv; ny *= inv; nz *= inv;
-
-            // Encode [-1,1] -> [0,1].
-            const int i = px - x;
-            rOut[i] = nx * 0.5f + 0.5f;
-            gOut[i] = ny * 0.5f + 0.5f;
-            bOut[i] = nz * 0.5f + 0.5f;
+        // Degenerate input (e.g. 1x1 black from an unconnected upstream): black out.
+        if (W < 2 || H < 2) {
+            const Box& b = outputPlane.bounds();
+            const int nc = outputPlane.channels().size();
+            for (int y = b.y(); y < b.t(); ++y)
+                for (int x = b.x(); x < b.r(); ++x)
+                    for (int c = 0; c < nc; ++c) outputPlane.writableAt(x, y, c) = 0.0f;
+            return;
         }
+
+        bool done = false;
+        try {
+            ::Blink::Image outImg, inImg;
+            if (DD::Image::Blink::ImagePlaneAsBlinkImage(outputPlane, outImg) &&
+                DD::Image::Blink::ImagePlaneAsBlinkImage(inputPlane, inImg)) {
+                bool usingGPU = _useGPUIfAvailable && _gpuDevice.available();
+                ::Blink::ComputeDevice dev =
+                    usingGPU ? _gpuDevice : ::Blink::ComputeDevice::CurrentCPUDevice();
+
+                ::Blink::Image inOnDev  = inImg.distributeTo(dev);
+                ::Blink::Image outOnDev = usingGPU ? outImg.makeLike(_gpuDevice) : outImg;
+
+                ::Blink::ComputeDeviceBinder binder(dev);
+                std::vector< ::Blink::Image > images;
+                images.push_back(inOnDev);
+                images.push_back(outOnDev);
+                ::Blink::Kernel kernel(_program, dev, images, kBlinkCodegenDefault);
+                kernel.setParamValue("K", _strength * 200.0f);
+                kernel.setParamValue("GySign", _directX ? -1.0f : 1.0f);
+                kernel.setParamValue("HeightSrc", _heightSrc);
+                kernel.iterate();
+                if (usingGPU) outImg.copyFrom(outOnDev);
+                done = true;
+            }
+        }
+        catch (::Blink::Exception&) {
+            done = false;   // fall through to CPU
+        }
+        if (!done) renderCPU(outputPlane, inputPlane, inputBox);
     }
 };
 
