@@ -21,6 +21,7 @@
 #include "DDImage/Row.h"
 #include "DDImage/Knobs.h"
 #include "DDImage/Tile.h"
+#include "DDImage/Interest.h"
 #include "DDImage/Blink.h"
 #include "Blink/Blink.h"
 
@@ -348,7 +349,7 @@ static const char* const N2H_HELP =
     "Periodic boundary (FFT) makes tileable normal maps reconstruct seamlessly.\n"
     "The full-image solve runs once per validate and is cached.";
 
-class NormalToHeight : public Iop
+class NormalToHeight : public PlanarIop
 {
     float _strength;     // scales the input normal's tangent (slope) -1..1
     float _maxSlope;     // clip |p|,|q| to this to kill grazing-normal spikes
@@ -361,7 +362,7 @@ class NormalToHeight : public Iop
     bool _cacheValid;
 
 public:
-    NormalToHeight(Node* node) : Iop(node)
+    NormalToHeight(Node* node) : PlanarIop(node)
         , _strength(1.0f)
         , _maxSlope(5.0f)
         , _clip(0.00001f)
@@ -415,66 +416,80 @@ public:
         // null source Op). Leave the base Iop's default (black) info untouched.
         if (input0().node() == nullptr) {
             set_out_channels(Mask_None);
-            _cacheValid = true;   // nothing to solve
             _height.clear();
             return;
         }
         copy_info();
         info_.turn_on(Mask_RGB);
         set_out_channels(Mask_RGB);
-        // Force a recompute; the heavy full-image solve happens once in
-        // _open() (single-threaded), never in engine() (worker threads).
-        _cacheValid = false;
     }
 
-    void _request(int x, int y, int r, int t, ChannelMask channels, int count) override
+    void getRequests(const Box& box, const ChannelSet& channels, int count,
+                     RequestOutput& reqData) const override
     {
-        if (input0().node() == nullptr) return;
         // FC integration needs the whole image.
         const Box& b = input0().info().box();
-        input0().request(b.x(), b.y(), b.r(), b.t(), Mask_RGB, count);
+        reqData.request(&input0(), b, Mask_RGB, count);
     }
 
-    // Called once on the main thread before engine() runs on workers. This is
-    // the safe place to do the whole-image FFT solve and fill the cache.
-    void _open() override
+    bool useStripes() const override { return false; }
+    bool renderFullPlanes() const override { return true; }
+
+    void renderStripe(ImagePlane& outputPlane) override
     {
-        if (input0().node() == nullptr) { _cacheValid = true; _height.clear(); return; }
-        if (!_cacheValid) buildCache();
+        if (input0().node() == nullptr) { outputPlane.makeWritable(); return; }
+
+        const Box& ibox = input0().info().box();
+        ImagePlane inputPlane(ibox, outputPlane.packed(),
+                              outputPlane.channels(), outputPlane.nComps());
+        input0().fetchPlane(inputPlane);
+        if (aborted()) return;
+
+        buildHeight(inputPlane, ibox);
+
+        outputPlane.makeWritable();
+        const Box& ob = outputPlane.bounds();
+        const int nc = outputPlane.channels().size();
+        if (_height.empty()) {
+            for (int y = ob.y(); y < ob.t(); ++y)
+                for (int x = ob.x(); x < ob.r(); ++x)
+                    for (int c = 0; c < nc; ++c) outputPlane.writableAt(x, y, c) = 0.0f;
+            return;
+        }
+        const int W = _cw, H = _ch;
+        for (int y = ob.y(); y < ob.t(); ++y) {
+            const int row = ((y - _cy0) % H + H) % H;
+            for (int x = ob.x(); x < ob.r(); ++x) {
+                const int col = ((x - _cx0) % W + W) % W;
+                const float h = _height[(size_t)row * W + col];
+                for (int c = 0; c < nc; ++c) outputPlane.writableAt(x, y, c) = (c < 3) ? h : 1.0f;
+            }
+        }
     }
 
     // Decode + integrate the full image once; store into _height.
-    void buildCache()
+    void buildHeight(const ImagePlane& in, const Box& ibox)
     {
-        const Box& ibox = input0().info().box();
         _cx0 = ibox.x(); _cy0 = ibox.y();
         _cw = ibox.r() - ibox.x();
         _ch = ibox.t() - ibox.y();
-        // Bail on degenerate input (e.g. the 1x1 black Iop from an unconnected
-        // input). engine() then erases to black.
-        if (_cw < 2 || _ch < 2) { _cacheValid = true; _height.clear(); return; }
-
-        Tile tile(input0(), ibox.x(), ibox.y(), ibox.r(), ibox.t(), Mask_RGB);
-        if (aborted()) return;
+        if (_cw < 2 || _ch < 2) { _height.clear(); return; }
 
         const int W = _cw, H = _ch;
+        const int nComp = in.channels().size();
+
         // Slope fields p = dz/dx, q = dz/dy from the decoded normal.
         std::vector<double> p((size_t)W * H), q((size_t)W * H);
 
         const float gy_sign = _directX ? -1.0f : 1.0f;
 
-        auto sample = [&](Channel c, int sx, int sy, float dflt) -> float {
-            const float* rowp = tile[c][sy];
-            return rowp ? rowp[sx] : dflt;
-        };
-
         for (int yy = 0; yy < H; ++yy) {
             const int sy = yy + _cy0;
             for (int xx = 0; xx < W; ++xx) {
                 const int sx = xx + _cx0;
-                float nr = sample(Chan_Red,   sx, sy, 0.5f);
-                float ng = sample(Chan_Green, sx, sy, 0.5f);
-                float nb = sample(Chan_Blue,  sx, sy, 1.0f);
+                float nr = in.at(sx, sy, 0);
+                float ng = nComp > 1 ? in.at(sx, sy, 1) : 0.5f;
+                float nb = nComp > 2 ? in.at(sx, sy, 2) : 1.0f;
 
                 // Decode 0..1 -> [-1,1]. The tangent (X/Y) components are scaled
                 // by 'strength' in normal space (sign inverts, 0 flattens; a
@@ -601,29 +616,6 @@ public:
             }
         }
 
-        _cacheValid = true;
-    }
-
-    void engine(int y, int x, int r, ChannelMask channels, Row& out) override
-    {
-        // Cache is built in _open() (main thread). Never solve here: engine()
-        // runs on multiple worker threads and a write race would crash.
-        if (!_cacheValid || _height.empty()) { out.erase(channels); return; }
-
-        const int W = _cw, H = _ch;
-        auto wrapX = [&](int xx) { return ((xx - _cx0) % W + W) % W; };
-        const int row = ((y - _cy0) % H + H) % H;
-
-        float* rOut = out.writable(Chan_Red)   + x;
-        float* gOut = out.writable(Chan_Green) + x;
-        float* bOut = out.writable(Chan_Blue)  + x;
-
-        for (int px = x; px < r; ++px) {
-            const int col = wrapX(px);
-            const float h = _height[(size_t)row * W + col];
-            const int i = px - x;
-            rOut[i] = h; gOut[i] = h; bOut[i] = h;
-        }
     }
 };
 
